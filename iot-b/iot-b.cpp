@@ -40,7 +40,9 @@ static const char* iot_resolve_client_id(const char* requested) {
 // Wi‑Fi event logging (attach once)
 // -------------------------------------------------------------------------------------------------
 static bool s_wifiEventsAttached = false;
-static constexpr uint8_t  MAX_WIFI_RETRIES  = 5;
+static constexpr uint8_t  MAX_WIFI_RETRIES = 5;
+static constexpr uint32_t CAMPUS_WIFI_ATTEMPT_TIMEOUT_MS = 20000;
+static constexpr uint32_t CAMPUS_WIFI_POLL_MS = 250;
 
 static void attach_wifi_events_once() {
   if (s_wifiEventsAttached) return;
@@ -174,8 +176,25 @@ bool connect_to_home_wifi(const char *ssid, const char *password, bool use_bssid
 }
 
 // -------------------------------------------------------------------------------------------------
-// WPA2‑Enterprise
+// WPA2-Enterprise (PEAP / MSCHAPv2)
 // -------------------------------------------------------------------------------------------------
+static void campus_reset_station() {
+  // Fully stop STA before applying a new enterprise configuration. This avoids
+  // esp_wifi_set_config() racing a previous in-progress connection attempt.
+  WiFi.disconnect(true, false);
+
+  const uint32_t stop_started_ms = millis();
+  while (WiFi.getMode() != WIFI_MODE_NULL &&
+         (uint32_t)(millis() - stop_started_ms) < 2000) {
+    delay(20);
+    yield();
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  delay(100);
+}
+
 bool connect_to_campus_wifi(const char *ssid,
                             const char *username,
                             const char *password,
@@ -186,78 +205,129 @@ bool connect_to_campus_wifi(const char *ssid,
     return false;
   }
 
+  attach_wifi_events_once();
   WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.disconnect(true, true);
-  delay(200);
 
+  const char* identity = (outer_identity && *outer_identity) ? outer_identity : username;
+
+  // Start from a clean STA state before the first enterprise begin().
+  campus_reset_station();
+
+  // Indonesia: channels 1..13.
   wifi_country_t c = { "ID", 1, 13, WIFI_COUNTRY_POLICY_MANUAL };
-  esp_wifi_set_country(&c);
-
-  if (outer_identity && *outer_identity)
-    ESP_ERROR_CHECK( esp_eap_client_set_identity((const uint8_t*)outer_identity, strlen(outer_identity)) );
-  else
-    ESP_ERROR_CHECK( esp_eap_client_set_identity((const uint8_t*)username, strlen(username)) );
-
-  ESP_ERROR_CHECK( esp_eap_client_set_username((const uint8_t*)username, strlen(username)) );
-  ESP_ERROR_CHECK( esp_eap_client_set_password((const uint8_t*)password, strlen(password)) );
-
-  ESP_ERROR_CHECK( esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_PAP) );
-  ESP_ERROR_CHECK( esp_eap_client_set_ca_cert(nullptr, 0) );
-  ESP_ERROR_CHECK( esp_wifi_sta_enterprise_enable() );
+  esp_err_t err = esp_wifi_set_country(&c);
+  if (err != ESP_OK) {
+    LOGW("esp_wifi_set_country failed: %d", (int)err);
+  }
 
   BssidPick pick = {};
-  if (lock_to_best_bssid) {
-    pick = pick_best_bssid_for_ssid(ssid);
-    if (pick.found) {
-      LOGI("locking to %s RSSI=%ld dBm BSSID %02X:%02X:%02X:%02X:%02X:%02X ch=%ld",
-           ssid, (long)pick.rssi,
-           pick.bssid[0], pick.bssid[1], pick.bssid[2],
-           pick.bssid[3], pick.bssid[4], pick.bssid[5],
-           (long)pick.channel);
-      WiFi.begin(ssid, "", pick.channel, pick.bssid, true);
-    } else {
-      LOGW("scan didn’t find '%s'; generic connect", ssid);
-      WiFi.begin(ssid);
+
+  for (uint8_t attempt = 1; attempt <= MAX_WIFI_RETRIES; ++attempt) {
+    if (attempt > 1) {
+      // Stop the previous attempt completely before changing STA config again.
+      campus_reset_station();
     }
-  } else {
-    LOGI("connecting to '%s' without BSSID lock", ssid);
-    WiFi.begin(ssid);
-  }
 
-  wl_status_t st;
-  uint32_t last_scan_ms = 0;
-  uint32_t wifi_connect_retries = 0;
+    wl_status_t begin_status = WL_IDLE_STATUS;
 
-  while ((st = WiFi.status()) != WL_CONNECTED) {
-    delay(1000);
+    if (lock_to_best_bssid) {
+      // Re-scan on every retry so a stale/weak AP is not kept forever.
+      pick = pick_best_bssid_for_ssid(ssid);
 
-    if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) {
-      wifi_connect_retries = wifi_connect_retries + 1;
-      if (wifi_connect_retries >= MAX_WIFI_RETRIES) esp_restart();
+      if (pick.found) {
+        LOGI("campus attempt %u/%u: PEAP connect to '%s' via BSSID "
+             "%02X:%02X:%02X:%02X:%02X:%02X ch=%ld RSSI=%ld",
+             (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES,
+             ssid,
+             pick.bssid[0], pick.bssid[1], pick.bssid[2],
+             pick.bssid[3], pick.bssid[4], pick.bssid[5],
+             (long)pick.channel, (long)pick.rssi);
 
-      LOGW("quick re-begin due to status=%d", (int)st);
-      WiFi.disconnect(false, false);
-      delay(200);
-
-      if (lock_to_best_bssid) {
-        uint32_t now = millis();
-        if (now - last_scan_ms > 10000) {
-          pick = pick_best_bssid_for_ssid(ssid);
-          last_scan_ms = now;
-        }
-        if (pick.found) WiFi.begin(ssid, "", pick.channel, pick.bssid, true);
-        else            WiFi.begin(ssid);
+        begin_status = WiFi.begin(
+          ssid,
+          WPA2_AUTH_PEAP,
+          identity,
+          username,
+          password,
+          nullptr, nullptr, nullptr,
+          -1,
+          pick.channel,
+          pick.bssid,
+          true
+        );
       } else {
-        WiFi.begin(ssid);
+        LOGW("campus attempt %u/%u: '%s' not found by scan; trying generic PEAP connect",
+             (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES, ssid);
+
+        begin_status = WiFi.begin(
+          ssid,
+          WPA2_AUTH_PEAP,
+          identity,
+          username,
+          password
+        );
       }
+    } else {
+      LOGI("campus attempt %u/%u: PEAP connect to '%s' (AP selection unlocked)",
+           (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES, ssid);
+
+      begin_status = WiFi.begin(
+        ssid,
+        WPA2_AUTH_PEAP,
+        identity,
+        username,
+        password
+      );
     }
+
+    if (begin_status == WL_CONNECT_FAILED) {
+      LOGW("campus attempt %u/%u: WiFi.begin() rejected the enterprise connection",
+           (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES);
+      continue;
+    }
+
+    const uint32_t started_ms = millis();
+    uint32_t last_progress_ms = started_ms;
+    wl_status_t st = WiFi.status();
+
+    while ((uint32_t)(millis() - started_ms) < CAMPUS_WIFI_ATTEMPT_TIMEOUT_MS) {
+      st = WiFi.status();
+
+      if (st == WL_CONNECTED) {
+        LOGI("campus connected. IP=%s RSSI=%d",
+             WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        return true;
+      }
+
+      if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED) {
+        LOGW("campus attempt %u failed early, status=%d",
+             (unsigned)attempt, (int)st);
+        break;
+      }
+
+      const uint32_t now = millis();
+      if ((uint32_t)(now - last_progress_ms) >= 5000) {
+        LOGI("campus attempt %u: waiting for PEAP/DHCP, status=%d elapsed=%lu ms",
+             (unsigned)attempt, (int)st,
+             (unsigned long)(now - started_ms));
+        last_progress_ms = now;
+      }
+
+      delay(CAMPUS_WIFI_POLL_MS);
+      yield();
+    }
+
+    st = WiFi.status();
+    LOGW("campus attempt %u/%u did not connect (status=%d)",
+         (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES, (int)st);
   }
 
-  LOGI("connected. IP=%s RSSI=%d",
-       WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  return true;
+  // Leave the radio in a clean stopped state after final failure. A later call
+  // to iot_wifi_campus() will start STA again via campus_reset_station().
+  WiFi.disconnect(true, false);
+  LOGE("campus Wi-Fi failed after %u attempts; returning false",
+       (unsigned)MAX_WIFI_RETRIES);
+  return false;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -373,8 +443,8 @@ bool mqtt_connect(PubSubClient& client, const MqttConfig& cfg,
     LOGW("MQTT connect failed (state=%d) attempt %lu", client.state(), (unsigned long)attempt);
 
     if (max_retries != 0 && attempt >= max_retries) {
-      LOGE("MQTT connect giving up after %lu attempts → reboot!", (unsigned long)attempt);
-      esp_restart();
+      LOGE("MQTT connect giving up after %lu attempts; returning false",
+           (unsigned long)attempt);
       return false;
     }
 
