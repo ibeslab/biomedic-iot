@@ -11,7 +11,7 @@
  * The companion implementation lives in **iot-b.cpp**.
  *
  * @author  Auralius Manurung and ChatGPT
- * @version 1.1
+ * @version 1.2
  */
 
 #include <WiFi.h>
@@ -230,6 +230,107 @@ bool mqtt_subscribe(PubSubClient& client, const char* topic);
  * @brief Pump PubSubClient I/O. Call frequently in the main loop.
  */
 void mqtt_loop(PubSubClient& client);
+
+// =================================================================================================
+// Simple course-facing API
+// -------------------------------------------------------------------------------------------------
+// These helpers own one internal WiFiClient/PubSubClient/MqttConfig instance inside iot-b.cpp.
+// They are additive: the legacy object-based API above remains unchanged and can still be used.
+// -------------------------------------------------------------------------------------------------
+
+/** @brief MQTT callback type used by the simplified API. */
+using IotMqttCallback = void (*)(char*, byte*, unsigned int);
+
+/** @brief Short alias for @ref connect_to_home_wifi. */
+bool iot_wifi_home(const char* ssid, const char* password, bool use_bssid = false);
+
+/** @brief Short alias for @ref connect_to_campus_wifi. */
+bool iot_wifi_campus(const char* ssid,
+                     const char* username,
+                     const char* password,
+                     const char* outer_identity = nullptr,
+                     bool lock_to_best_bssid = true);
+
+/**
+ * @brief Set credentials used by the simplified MQTT client.
+ * @note May be called before begin(), or changed later and followed by reconnect().
+ */
+void iot_mqtt_set_credentials(const char* username, const char* password);
+
+/** @brief Clear username/password for the simplified MQTT client. */
+void iot_mqtt_clear_credentials();
+
+/** @brief Set or replace the optional Last Will for the simplified MQTT client. */
+void iot_mqtt_set_last_will(const char* topic,
+                            const char* payload,
+                            bool retain = true);
+
+/** @brief Set the callback used by the simplified MQTT client. */
+void iot_mqtt_set_callback(IotMqttCallback callback);
+
+/**
+ * @brief Set the PubSubClient MQTT buffer size used by the simplified client.
+ * @return true if PubSubClient accepted the requested size.
+ */
+bool iot_mqtt_set_buffer_size(uint16_t bytes);
+
+/**
+ * @brief Configure and connect the library-owned plaintext MQTT client.
+ * @param host       Broker hostname.
+ * @param port       Broker port, normally 1883.
+ * @param client_id  Optional client ID. If null/empty, a MAC-derived ID is generated.
+ * @param callback   Optional subscription callback.
+ */
+bool iot_mqtt_begin_plain(const char* host,
+                          uint16_t port = 1883,
+                          const char* client_id = nullptr,
+                          IotMqttCallback callback = nullptr);
+
+/**
+ * @brief Configure and connect the library-owned TLS MQTT client.
+ * @param host         Broker hostname.
+ * @param port         Broker port, normally 8883.
+ * @param client_id    Optional client ID. If null/empty, a MAC-derived ID is generated.
+ * @param callback     Optional subscription callback.
+ * @param verify_cert  Verify the supplied CA certificate when true.
+ * @param cert         Root CA certificate.
+ */
+bool iot_mqtt_begin_tls(const char* host,
+                        uint16_t port = 8883,
+                        const char* client_id = nullptr,
+                        IotMqttCallback callback = nullptr,
+                        bool verify_cert = true,
+                        const char* cert = hivemq_ca_cert);
+
+/** @brief Reconnect using the last simplified MQTT configuration. */
+bool iot_mqtt_reconnect(uint8_t max_retries = 10,
+                        uint32_t backoff_ms = 500);
+
+/** @brief Return true when the simplified MQTT client is connected. */
+bool iot_mqtt_connected();
+
+/** @brief Disconnect the simplified MQTT client and its underlying socket. */
+void iot_mqtt_disconnect();
+
+/** @brief Publish text with the simplified MQTT client. */
+bool iot_mqtt_publish_text(const char* topic,
+                           const char* payload,
+                           bool retained = false);
+
+/** @brief Publish arbitrary binary bytes with the simplified MQTT client. */
+bool iot_mqtt_publish_binary(const char* topic,
+                             const uint8_t* payload,
+                             size_t length,
+                             bool retained = false);
+
+/** @brief Subscribe using the simplified MQTT client. */
+bool iot_mqtt_subscribe(const char* topic);
+
+/** @brief Pump MQTT I/O for the simplified MQTT client. Call frequently. */
+void iot_mqtt_loop();
+
+/** @brief Return the active/generated simplified MQTT client ID. */
+const char* iot_mqtt_client_id();
 
 // =================================================================================================
 // RTP / UDP helpers (no classes)

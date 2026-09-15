@@ -8,6 +8,35 @@
 #include <cstring>
 
 // -------------------------------------------------------------------------------------------------
+// Simplified course-facing MQTT state
+// -------------------------------------------------------------------------------------------------
+// Kept private to this translation unit so sketches do not need to instantiate WiFiClient,
+// WiFiClientSecure, PubSubClient, or MqttConfig objects.
+static WiFiClient       s_iot_net;
+static WiFiClientSecure s_iot_secure_net;
+static PubSubClient     s_iot_mqtt;
+static MqttConfig       s_iot_cfg;
+static bool             s_iot_tls = false;
+static uint16_t         s_iot_buffer_size = MQTT_BUFFER_SIZE;
+static IotMqttCallback  s_iot_callback = nullptr;
+static char             s_iot_generated_client_id[40] = {0};
+
+static void iot_noop_callback(char*, byte*, unsigned int) {}
+
+static const char* iot_resolve_client_id(const char* requested) {
+  if (requested && *requested) return requested;
+
+  if (!s_iot_generated_client_id[0]) {
+    const uint32_t short_id = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFFULL);
+    snprintf(s_iot_generated_client_id,
+             sizeof(s_iot_generated_client_id),
+             "esp32-%08lX",
+             (unsigned long)short_id);
+  }
+  return s_iot_generated_client_id;
+}
+
+// -------------------------------------------------------------------------------------------------
 // Wi‑Fi event logging (attach once)
 // -------------------------------------------------------------------------------------------------
 static bool s_wifiEventsAttached = false;
@@ -460,6 +489,161 @@ bool mqtt_subscribe(PubSubClient& client, const char* topic) {
 
 void mqtt_loop(PubSubClient& client) {
   client.loop();
+}
+
+// -------------------------------------------------------------------------------------------------
+// Simplified course-facing API
+// -------------------------------------------------------------------------------------------------
+
+bool iot_wifi_home(const char* ssid, const char* password, bool use_bssid) {
+  return connect_to_home_wifi(ssid, password, use_bssid);
+}
+
+bool iot_wifi_campus(const char* ssid,
+                     const char* username,
+                     const char* password,
+                     const char* outer_identity,
+                     bool lock_to_best_bssid) {
+  return connect_to_campus_wifi(ssid,
+                                username,
+                                password,
+                                outer_identity,
+                                lock_to_best_bssid);
+}
+
+void iot_mqtt_set_credentials(const char* username, const char* password) {
+  s_iot_cfg.username = username;
+  s_iot_cfg.password = password;
+}
+
+void iot_mqtt_clear_credentials() {
+  s_iot_cfg.username = nullptr;
+  s_iot_cfg.password = nullptr;
+}
+
+void iot_mqtt_set_last_will(const char* topic,
+                            const char* payload,
+                            bool retain) {
+  s_iot_cfg.topic = topic;
+  s_iot_cfg.payload = payload;
+  s_iot_cfg.retain = retain;
+}
+
+void iot_mqtt_set_callback(IotMqttCallback callback) {
+  s_iot_callback = callback;
+  s_iot_mqtt.setCallback(callback ? callback : iot_noop_callback);
+}
+
+bool iot_mqtt_set_buffer_size(uint16_t bytes) {
+  if (bytes == 0) return false;
+  s_iot_buffer_size = bytes;
+  return s_iot_mqtt.setBufferSize(bytes);
+}
+
+bool iot_mqtt_begin_plain(const char* host,
+                          uint16_t port,
+                          const char* client_id,
+                          IotMqttCallback callback) {
+  if (!host || !*host) {
+    LOGE("iot_mqtt_begin_plain: empty host");
+    return false;
+  }
+
+  s_iot_tls = false;
+  s_iot_cfg.server = host;
+  s_iot_cfg.port = port;
+  s_iot_cfg.client_id = iot_resolve_client_id(client_id);
+
+  if (callback) s_iot_callback = callback;
+
+  mqtt_init(s_iot_mqtt,
+            s_iot_net,
+            host,
+            port,
+            s_iot_callback ? s_iot_callback : iot_noop_callback);
+
+  s_iot_mqtt.setBufferSize(s_iot_buffer_size);
+  return mqtt_connect(s_iot_mqtt, s_iot_cfg);
+}
+
+bool iot_mqtt_begin_tls(const char* host,
+                        uint16_t port,
+                        const char* client_id,
+                        IotMqttCallback callback,
+                        bool verify_cert,
+                        const char* cert) {
+  if (!host || !*host) {
+    LOGE("iot_mqtt_begin_tls: empty host");
+    return false;
+  }
+
+  s_iot_tls = true;
+  s_iot_cfg.server = host;
+  s_iot_cfg.port = port;
+  s_iot_cfg.client_id = iot_resolve_client_id(client_id);
+
+  if (callback) s_iot_callback = callback;
+
+  mqtt_configure_secure_client(s_iot_secure_net,
+                               verify_cert,
+                               cert ? cert : hivemq_ca_cert);
+
+  mqtt_init(s_iot_mqtt,
+            s_iot_secure_net,
+            host,
+            port,
+            s_iot_callback ? s_iot_callback : iot_noop_callback);
+
+  s_iot_mqtt.setBufferSize(s_iot_buffer_size);
+  return mqtt_connect(s_iot_mqtt, s_iot_cfg);
+}
+
+bool iot_mqtt_reconnect(uint8_t max_retries, uint32_t backoff_ms) {
+  if (s_iot_mqtt.connected()) return true;
+  return mqtt_connect(s_iot_mqtt, s_iot_cfg, max_retries, backoff_ms);
+}
+
+bool iot_mqtt_connected() {
+  return s_iot_mqtt.connected();
+}
+
+void iot_mqtt_disconnect() {
+  s_iot_mqtt.disconnect();
+  if (s_iot_tls) s_iot_secure_net.stop();
+  else           s_iot_net.stop();
+}
+
+bool iot_mqtt_publish_text(const char* topic,
+                           const char* payload,
+                           bool retained) {
+  return mqtt_publish(s_iot_mqtt, topic, payload, retained);
+}
+
+bool iot_mqtt_publish_binary(const char* topic,
+                             const uint8_t* payload,
+                             size_t length,
+                             bool retained) {
+  if (length > 0xFFFFFFFFu) {
+    LOGE("binary publish too large");
+    return false;
+  }
+  return mqtt_publish(s_iot_mqtt,
+                      topic,
+                      (const byte*)payload,
+                      (unsigned int)length,
+                      retained);
+}
+
+bool iot_mqtt_subscribe(const char* topic) {
+  return mqtt_subscribe(s_iot_mqtt, topic);
+}
+
+void iot_mqtt_loop() {
+  mqtt_loop(s_iot_mqtt);
+}
+
+const char* iot_mqtt_client_id() {
+  return s_iot_cfg.client_id ? s_iot_cfg.client_id : iot_resolve_client_id(nullptr);
 }
 
 void mqtt_hard_reset(PubSubClient& client, WiFiClientSecure& net) {
