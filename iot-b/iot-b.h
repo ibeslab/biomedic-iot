@@ -11,7 +11,7 @@
  * The companion implementation lives in **iot-b.cpp**.
  *
  * @author  Auralius Manurung and ChatGPT
- * @version 1.3
+ * @version 1.2
  */
 
 #include <WiFi.h>
@@ -84,26 +84,24 @@ extern const char emqx_ca_cert[];
 bool connect_to_home_wifi(const char *ssid, const char *password, bool use_bssid = false);
 
 /**
- * @brief Connect to a campus WPA/WPA2-Enterprise network using PEAP + MSCHAPv2.
+ * @brief Connect to a campus/enterprise WPA2 network using EAP (TTLS/PEAP‑style) via esp_eap_client.
  *
- * This profile matches TelU-Connect: PEAP outer authentication, username/password credentials,
- * optional anonymous outer identity, and no CA certificate. The helper retries bounded connection
- * attempts, logs Wi-Fi disconnect reasons, and returns false instead of rebooting when it cannot connect.
+ * The function sets up EAP identity/username/password, enables WPA2‑Enterprise, optionally scans and
+ * locks to the best BSSID for stability, and blocks until the station is connected.
  *
  * @param ssid               Enterprise SSID.
- * @param username           PEAP/MSCHAPv2 username.
- * @param password           PEAP/MSCHAPv2 password.
+ * @param username           EAP inner identity / username.
+ * @param password           EAP password.
  * @param outer_identity     Optional anonymous (outer) identity; if nullptr/empty, @p username is used.
  * @param lock_to_best_bssid If true, scan and lock to the strongest BSSID for @p ssid.
- *                           Defaults to false so campus AP roaming/fallback remains available.
- * @return `true` on successful association, `false` on invalid args, EAP setup failure, or retry exhaustion.
- * @note   Requires the Arduino-ESP32 core to include `esp_eap_client`.
+ * @return `true` on successful association (blocking), `false` on invalid args.
+ * @note   Requires the Arduino‑ESP32 core to include `esp_eap_client`.
  */
 bool connect_to_campus_wifi(const char *ssid,
                             const char *username,
                             const char *password,
                             const char *outer_identity = nullptr,
-                            bool lock_to_best_bssid = false);
+                            bool lock_to_best_bssid = true);
 
 // =================================================================================================
 // MQTT helpers (PubSubClient)
@@ -251,7 +249,7 @@ bool iot_wifi_campus(const char* ssid,
                      const char* username,
                      const char* password,
                      const char* outer_identity = nullptr,
-                     bool lock_to_best_bssid = false);
+                     bool lock_to_best_bssid = true);
 
 /**
  * @brief Set credentials used by the simplified MQTT client.
