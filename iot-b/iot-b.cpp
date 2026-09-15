@@ -40,7 +40,9 @@ static const char* iot_resolve_client_id(const char* requested) {
 // Wi‑Fi event logging (attach once)
 // -------------------------------------------------------------------------------------------------
 static bool s_wifiEventsAttached = false;
-static constexpr uint8_t  MAX_WIFI_RETRIES  = 5;
+static constexpr uint8_t  MAX_WIFI_RETRIES = 5;
+static constexpr uint32_t CAMPUS_WIFI_ATTEMPT_TIMEOUT_MS = 20000;
+static constexpr uint32_t CAMPUS_WIFI_POLL_MS = 250;
 
 static void attach_wifi_events_once() {
   if (s_wifiEventsAttached) return;
@@ -186,78 +188,138 @@ bool connect_to_campus_wifi(const char *ssid,
     return false;
   }
 
+  attach_wifi_events_once();
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.disconnect(true, true);
-  delay(200);
 
+  // Clear any previously saved AP selection, but keep the Wi-Fi radio enabled.
+  WiFi.disconnect(false, true);
+  delay(300);
+
+  // Indonesia: channels 1..13.
   wifi_country_t c = { "ID", 1, 13, WIFI_COUNTRY_POLICY_MANUAL };
-  esp_wifi_set_country(&c);
+  esp_err_t err = esp_wifi_set_country(&c);
+  if (err != ESP_OK) {
+    LOGW("esp_wifi_set_country failed: %d", (int)err);
+  }
 
-  if (outer_identity && *outer_identity)
-    ESP_ERROR_CHECK( esp_eap_client_set_identity((const uint8_t*)outer_identity, strlen(outer_identity)) );
-  else
-    ESP_ERROR_CHECK( esp_eap_client_set_identity((const uint8_t*)username, strlen(username)) );
+  const char* identity = (outer_identity && *outer_identity) ? outer_identity : username;
 
-  ESP_ERROR_CHECK( esp_eap_client_set_username((const uint8_t*)username, strlen(username)) );
-  ESP_ERROR_CHECK( esp_eap_client_set_password((const uint8_t*)password, strlen(password)) );
+  // TelU-Connect profile:
+  //   outer EAP : PEAP
+  //   inner auth: MSCHAPv2 (handled by PEAP username/password credentials)
+  //   CA cert   : not required by the campus profile
+  err = esp_eap_client_set_identity((const uint8_t*)identity, strlen(identity));
+  if (err != ESP_OK) {
+    LOGE("set EAP identity failed: %d", (int)err);
+    return false;
+  }
 
-  ESP_ERROR_CHECK( esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_PAP) );
-  ESP_ERROR_CHECK( esp_eap_client_set_ca_cert(nullptr, 0) );
-  ESP_ERROR_CHECK( esp_wifi_sta_enterprise_enable() );
+  err = esp_eap_client_set_username((const uint8_t*)username, strlen(username));
+  if (err != ESP_OK) {
+    LOGE("set EAP username failed: %d", (int)err);
+    return false;
+  }
+
+  err = esp_eap_client_set_password((const uint8_t*)password, strlen(password));
+  if (err != ESP_OK) {
+    LOGE("set EAP password failed: %d", (int)err);
+    return false;
+  }
+
+  err = esp_eap_client_set_eap_methods(ESP_EAP_TYPE_PEAP);
+  if (err != ESP_OK) {
+    LOGE("select PEAP failed: %d", (int)err);
+    return false;
+  }
+
+  // Match the campus client profile: no CA certificate is required.
+  err = esp_eap_client_set_ca_cert(nullptr, 0);
+  if (err != ESP_OK) {
+    LOGE("clear EAP CA certificate failed: %d", (int)err);
+    return false;
+  }
+
+  err = esp_wifi_sta_enterprise_enable();
+  if (err != ESP_OK) {
+    LOGE("enable enterprise Wi-Fi failed: %d", (int)err);
+    return false;
+  }
 
   BssidPick pick = {};
-  if (lock_to_best_bssid) {
-    pick = pick_best_bssid_for_ssid(ssid);
-    if (pick.found) {
-      LOGI("locking to %s RSSI=%ld dBm BSSID %02X:%02X:%02X:%02X:%02X:%02X ch=%ld",
-           ssid, (long)pick.rssi,
-           pick.bssid[0], pick.bssid[1], pick.bssid[2],
-           pick.bssid[3], pick.bssid[4], pick.bssid[5],
-           (long)pick.channel);
-      WiFi.begin(ssid, "", pick.channel, pick.bssid, true);
-    } else {
-      LOGW("scan didn’t find '%s'; generic connect", ssid);
-      WiFi.begin(ssid);
-    }
-  } else {
-    LOGI("connecting to '%s' without BSSID lock", ssid);
-    WiFi.begin(ssid);
-  }
 
-  wl_status_t st;
-  uint32_t last_scan_ms = 0;
-  uint32_t wifi_connect_retries = 0;
-
-  while ((st = WiFi.status()) != WL_CONNECTED) {
-    delay(1000);
-
-    if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) {
-      wifi_connect_retries = wifi_connect_retries + 1;
-      if (wifi_connect_retries >= MAX_WIFI_RETRIES) esp_restart();
-
-      LOGW("quick re-begin due to status=%d", (int)st);
+  for (uint8_t attempt = 1; attempt <= MAX_WIFI_RETRIES; ++attempt) {
+    if (attempt > 1) {
       WiFi.disconnect(false, false);
-      delay(200);
+      delay(500);
+    }
 
-      if (lock_to_best_bssid) {
-        uint32_t now = millis();
-        if (now - last_scan_ms > 10000) {
-          pick = pick_best_bssid_for_ssid(ssid);
-          last_scan_ms = now;
-        }
-        if (pick.found) WiFi.begin(ssid, "", pick.channel, pick.bssid, true);
-        else            WiFi.begin(ssid);
+    if (lock_to_best_bssid) {
+      // Re-scan on every retry so a stale/weak AP is not kept forever.
+      pick = pick_best_bssid_for_ssid(ssid);
+      if (pick.found) {
+        LOGI("campus attempt %u/%u: PEAP connect to '%s' via BSSID "
+             "%02X:%02X:%02X:%02X:%02X:%02X ch=%ld RSSI=%ld",
+             (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES,
+             ssid,
+             pick.bssid[0], pick.bssid[1], pick.bssid[2],
+             pick.bssid[3], pick.bssid[4], pick.bssid[5],
+             (long)pick.channel, (long)pick.rssi);
+        WiFi.begin(ssid, "", pick.channel, pick.bssid, true);
       } else {
+        LOGW("campus attempt %u/%u: '%s' not found by scan; trying generic PEAP connect",
+             (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES, ssid);
         WiFi.begin(ssid);
       }
+    } else {
+      LOGI("campus attempt %u/%u: PEAP connect to '%s' (AP selection unlocked)",
+           (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES, ssid);
+      WiFi.begin(ssid);
     }
+
+    const uint32_t started_ms = millis();
+    uint32_t last_progress_ms = started_ms;
+    wl_status_t st = WiFi.status();
+
+    while ((uint32_t)(millis() - started_ms) < CAMPUS_WIFI_ATTEMPT_TIMEOUT_MS) {
+      st = WiFi.status();
+      if (st == WL_CONNECTED) {
+        LOGI("campus connected. IP=%s RSSI=%d",
+             WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        return true;
+      }
+
+      // No SSID / immediate connection failure should retry promptly rather than
+      // waiting the full enterprise-auth timeout.
+      if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED) {
+        LOGW("campus attempt %u failed early, status=%d",
+             (unsigned)attempt, (int)st);
+        break;
+      }
+
+      const uint32_t now = millis();
+      if ((uint32_t)(now - last_progress_ms) >= 5000) {
+        LOGI("campus attempt %u: waiting for PEAP/DHCP, status=%d elapsed=%lu ms",
+             (unsigned)attempt, (int)st,
+             (unsigned long)(now - started_ms));
+        last_progress_ms = now;
+      }
+
+      delay(CAMPUS_WIFI_POLL_MS);
+      yield();
+    }
+
+    st = WiFi.status();
+    LOGW("campus attempt %u/%u did not connect (status=%d)",
+         (unsigned)attempt, (unsigned)MAX_WIFI_RETRIES, (int)st);
   }
 
-  LOGI("connected. IP=%s RSSI=%d",
-       WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  return true;
+  WiFi.disconnect(false, false);
+  LOGE("campus Wi-Fi failed after %u attempts; returning false",
+       (unsigned)MAX_WIFI_RETRIES);
+  return false;
 }
 
 // -------------------------------------------------------------------------------------------------
